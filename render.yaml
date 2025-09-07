@@ -9,4 +9,5 @@ services:
     autoDeploy: true
 
     runtime:
-      pythonversion: 3.11.9
+
+      pythonversion: 3.12.3
