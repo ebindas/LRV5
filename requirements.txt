@@ -7,4 +7,4 @@ numpy
 truststore
 notion-client
 
-kite-trade
+
