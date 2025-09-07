@@ -1,15 +1,16 @@
 import ssl
 import logging
 import math
-from datetime import date, timedelta
+import json
+import re
+from datetime import date, timedelta, datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
 import numpy as np
 import pandas as pd
 import truststore
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field, SecretStr
+from fastapi import FastAPI, HTTPException, Request, Body
 from starlette.responses import JSONResponse
 
 from notion_client import Client as NotionClient
@@ -29,17 +30,7 @@ logging.basicConfig(
 log = logging.getLogger("app")
 
 notion = NotionClient(auth=NOTION_TOKEN, client=httpx.Client(verify=TLS_CTX))
-app = FastAPI(title="Notion ↔ Kite FastAPI", version="local-fund-lots")
-
-# ================== MODELS ==================
-class Payload(BaseModel):
-    DATABASE_ID: str = Field(
-        pattern=r"^[0-9a-f]{32}$",
-        description="32-char lowercase hex id",
-    )
-    Date: date
-    entoken: SecretStr
-    fund: float = Field(gt=0, description="Capital available for allocation")
+app = FastAPI(title="Notion ↔ Kite FastAPI", version="automation-only")
 
 # ================== ERROR SHAPE / HEALTH ==================
 @app.get("/healthz")
@@ -63,7 +54,7 @@ def _first_plain_text(prop: Optional[dict], field: str) -> Optional[str]:
     if not arr:
         return None
     item = arr[0]
-    return item.get("plain_text") or item.get("text", {}).get("content")
+    return item.get("plain_text") or (item.get("text") or {}).get("content")
 
 def fetch_notion_dataframe(database_id: str) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
@@ -105,7 +96,6 @@ def notion_update(df: pd.DataFrame) -> None:
         return
     import time as _t
 
-    # Include BuySellLots among numeric props
     number_cols = ["open", "high", "low", "close", "PrevClose", "DayGain", "Gain", "ATRP", "MARatio", "BuySellLots"]
     for c in number_cols:
         if c in df.columns:
@@ -118,9 +108,8 @@ def notion_update(df: pd.DataFrame) -> None:
         # Numbers (avoid NaN/inf)
         for c in number_cols:
             val = r.get(c)
-            if pd.notna(val):
-                if isinstance(val, (int, float)) and not (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
-                    props[c] = {"number": float(val)}
+            if pd.notna(val) and isinstance(val, (int, float)) and not (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+                props[c] = {"number": float(val)}
 
         # Date
         if pd.notna(r.get("Date")):
@@ -211,13 +200,12 @@ def extract_stock_data(entoken: str, start_date: date, end_date: date, notion_in
         pd.to_numeric(final["ATRP"], errors="coerce")
     ).replace([np.inf, -np.inf], np.nan).round(2)
 
-    # NEW logic: BuySellLots = floor(fund / MARGIN) * LOT_SIZE  (whole lots first)
+    # BuySellLots = floor(fund / MARGIN) * LOT_SIZE
     mgn = pd.to_numeric(final["MARGIN"], errors="coerce")
     lot = pd.to_numeric(final["LOT_SIZE"], errors="coerce")
     with np.errstate(divide="ignore", invalid="ignore"):
-        lots = np.floor(float(fund) / mgn)          # whole number of lots
-        final["BuySellLots"] = (lots * lot)         # resulting quantity (shares)
-        # Make it integral where possible, allow NA
+        lots = np.floor(float(fund) / mgn)          # number of lots
+        final["BuySellLots"] = (lots * lot)         # quantity (shares)
         final["BuySellLots"] = pd.to_numeric(final["BuySellLots"], errors="coerce").round(0).astype("Int64")
 
     final = status_check(final)
@@ -231,22 +219,128 @@ def extract_stock_data(entoken: str, start_date: date, end_date: date, notion_in
 
     return final.reset_index(drop=True)
 
+# ================== NOTION AUTOMATION DECODER (ONLY) ==================
+def _join_title_text(prop: Optional[dict]) -> Optional[str]:
+    """Join title fragments to a single string (properties.<name>.title[])."""
+    if not isinstance(prop, dict):
+        return None
+    out = []
+    for it in prop.get("title") or []:
+        out.append(it.get("plain_text") or (it.get("text") or {}).get("content") or "")
+    s = "".join(out).strip()
+    return s if s else None
+
+def _join_rich_text_plain(prop: Optional[dict]) -> Optional[str]:
+    """Join rich_text fragments to a single string (properties.<name>.rich_text[])."""
+    if not isinstance(prop, dict):
+        return None
+    out = []
+    for it in prop.get("rich_text") or []:
+        out.append(it.get("plain_text") or (it.get("text") or {}).get("content") or "")
+    s = "".join(out).strip()
+    return s if s else None
+
+def _get_date_start(prop: Optional[dict]) -> Optional[date]:
+    """
+    Extract a date from a Notion property that may be:
+      - type == "date":         prop["date"]["start"]
+      - type == "formula":      prop["formula"]["date"]["start"]  (your new payload)
+                                or prop["formula"]["string"]      (fallback)
+    """
+    if not isinstance(prop, dict):
+        return None
+
+    start = None
+    if prop.get("type") == "date" and isinstance(prop.get("date"), dict):
+        start = (prop["date"] or {}).get("start")
+    elif prop.get("type") == "formula" and isinstance(prop.get("formula"), dict):
+        f = prop["formula"]
+        if f.get("type") == "date" and isinstance(f.get("date"), dict):
+            start = (f["date"] or {}).get("start")
+        elif f.get("type") == "string":
+            start = f.get("string")
+
+    if not start:
+        return None
+    try:
+        return datetime.fromisoformat(start[:10]).date()
+    except Exception:
+        return None
+
+def _get_number(prop: Optional[dict]) -> Optional[float]:
+    """properties.<name>.number -> float"""
+    if not isinstance(prop, dict):
+        return None
+    val = prop.get("number")
+    try:
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+def _extract_from_automation(body: Any) -> Dict[str, Any]:
+    """
+    Accept ONLY Notion Automation payloads.
+    Return a simple dict: {"DATABASE_ID": str, "Date": date, "entoken": str, "fund": float}
+    """
+    # JSON string → dict
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be JSON or JSON string")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Must be a Notion Automation payload
+    if body.get("source", {}).get("type") != "automation" or "data" not in body:
+        raise HTTPException(status_code=400, detail="Only Notion Automation payloads are accepted")
+
+    data = body["data"]
+    props = data.get("properties") or {}
+    parent = data.get("parent") or {}
+
+    entoken = _join_title_text(props.get("entoken"))
+    dbid = _join_rich_text_plain(props.get("DATABASE_ID")) or parent.get("database_id")
+    dt = _get_date_start(props.get("Date"))
+    fund = _get_number(props.get("fund"))
+
+    if not entoken:
+        raise HTTPException(status_code=400, detail="entoken not found in properties.title")
+    if not dbid:
+        raise HTTPException(status_code=400, detail="DATABASE_ID not found (rich_text) and no parent.database_id")
+    if not dt:
+        raise HTTPException(status_code=400, detail="Date not found/invalid")
+    if fund is None:
+        raise HTTPException(status_code=400, detail="fund not found/invalid")
+
+    if not isinstance(dbid, str) or not re.fullmatch(r"[0-9a-f]{32}", dbid or ""):
+        raise HTTPException(status_code=400, detail="DATABASE_ID invalid (must be 32-char lowercase hex)")
+
+    return {"DATABASE_ID": dbid, "Date": dt, "entoken": entoken, "fund": float(fund)}
+
 # ================== ROUTES ==================
 @app.get("/")
 def root() -> Dict[str, str]:
     return {"message": "FastAPI running"}
 
 @app.post("/notion")
-def run_notion(payload: Payload) -> Dict[str, str]:
-    notion_input = fetch_notion_dataframe(payload.DATABASE_ID)
-    start_date = payload.Date - timedelta(days=12)
+def run_notion(automation_payload: dict | str = Body(...)) -> Dict[str, str]:
+    """
+    Only accepts Notion Automation payloads.
+    Converts to {DATABASE_ID, Date, entoken, fund} internally and runs the pipeline.
+    """
+    merged = _extract_from_automation(automation_payload)
+
+    notion_input = fetch_notion_dataframe(merged["DATABASE_ID"])
+    start_date = merged["Date"] - timedelta(days=12)
 
     stock_data = extract_stock_data(
-        entoken=payload.entoken.get_secret_value(),
+        entoken=merged["entoken"],
         start_date=start_date,
-        end_date=payload.Date,
+        end_date=merged["Date"],
         notion_input=notion_input,
-        fund=payload.fund,
+        fund=merged["fund"],
     )
 
     notion_update(stock_data)
